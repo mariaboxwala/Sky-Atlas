@@ -901,6 +901,12 @@ svg.chart .grid{stroke:var(--line)}
       <div id="corrOut"></div>
       <div id="monthChart"></div>
 
+      <h3>4 · Lux readings vs the light-pollution model</h3>
+      <p class="sub">Each dot is one reading from 4 Nov 2026, placed at the model's artificial-glow ratio for that spot. The solid line is the calibration used for the lux surface; the dashed line is what a meter would read from sky glow alone on a clear, moonless night.</p>
+      <div id="luxChart"></div>
+      <div class="tbl-wrap" style="margin-top:8px"><table id="luxTbl"></table></div>
+      <p class="sub" id="luxNote" style="margin-top:6px"></p>
+
       <div class="prose" style="margin-top:16px" id="findings"></div>
     </div>
 
@@ -1360,7 +1366,7 @@ function paintField(layer, field, tf) {
     data[o] = lut[j]; data[o + 1] = lut[j + 1]; data[o + 2] = lut[j + 2]; data[o + 3] = lut[j + 3]; }
   layer._ctx.putImageData(img, 0, 0); return "ok";
 }
-const skyNow = new CanvasOverlay("", overlayBounds, { opacity: 0.7, interactive: false, onShow: () => renderMap() }).addTo(map);
+const skyNow = new CanvasOverlay("", overlayBounds, { opacity: 0.7, interactive: false, onShow: () => renderMap() });
 const scoreNow = new CanvasOverlay("", overlayBounds, { opacity: 0.85, interactive: false, onShow: () => renderMap() });
 // static reference: moonless, clear, AOD 0.35, lights constant
 const SQMREF = Array.from(ARTLV[5], r => M.nl2mag(M.mag2nl(M.P.natural) * (1 + r)));
@@ -1425,7 +1431,7 @@ const LUX = [
     r: [[11, 0.12, "2:11"], [12, 0.13, "2:22"], [13, 0.11, "2:30"], [14, 0.21, "2:40"], [15, 0.12, "2:57"], [16, 0.12, "3:06"]] },
 ];
 const LUX_STOPS = [[-1, [88, 104, 150]], [0, [150, 118, 170]], [1, [222, 140, 70]], [2, [255, 205, 95]], [2.3, [255, 236, 170]]];
-const luxRGB = v => rampFn(LUX_STOPS)(Math.log10(Math.max(0.05, v)));
+const luxRamp = rampFn(LUX_STOPS), luxRGB = v => luxRamp(Math.log10(Math.max(0.05, v)));
 const fmtLux = v => v >= 10 ? Math.round(v).toString() : v >= 1 ? v.toFixed(1) : v.toFixed(2);
 const median = a => { const b = [...a].sort((x, y) => x - y), m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; };
 function luxPopup(L0) {
@@ -1453,8 +1459,51 @@ const luxLayer = L.layerGroup(LUX.map(L0 => { const med = median(L0.r.map(r => r
     icon: L.divIcon({ className: "", iconSize: [0, 0], html: `<div class="lux-pin" style="background:rgb(${c[0]},${c[1]},${c[2]});color:${dark ? "#14171f" : "#fff"}"><i>${L0.s}</i>${fmtLux(med)} lx</div>` }) })
     .bindPopup(() => luxPopup(L0), { maxWidth: 280, autoPanPaddingTopLeft: [56, 16], autoPanPaddingBottomRight: [16, 16] }); })).addTo(map);
 
+/* ---------- lux surface: readings calibrated against the modeled glow field ----------
+   Three sites cannot support a purely spatial interpolation (kriging or IDW would only draw rings around each pin), and
+   a straight log–log regression on the glow ratio has a slope near 4.7 that predicts 16,000 lx on Reem Island.
+   So the model's artificial-glow ratio (Walker's law, AOD 0.35, lights constant) supplies the spatial pattern and the
+   readings supply the scale: site geometric means are forced to rise with glow (pool-adjacent-violators), joined
+   piecewise-linearly in log–log space, and held flat beyond the dimmest and brightest site. Add sites to LUX and the
+   whole surface refits. */
+const glowX = (lat, lon) => Math.log10(Math.max(1e-3, M.artRatio(lat, lon, M.P.tau0, 0)));
+function buildCal(list) {
+  const pts = list.map(L0 => { const y = L0.r.map(r => Math.log10(Math.max(0.01, r[1]))), m = y.reduce((a, b) => a + b, 0) / y.length;
+    return { s: L0.s, site: L0.site, x: glowX(L0.lat, L0.lon), y: m, n: y.length, ss: y.reduce((a, b) => a + (b - m) ** 2, 0) }; }).sort((a, b) => a.x - b.x);
+  const blk = []; // pool adjacent violators, weighted by number of readings
+  for (const p of pts) { blk.push({ w: p.n, wy: p.n * p.y, m: [p] });
+    while (blk.length > 1 && blk[blk.length - 2].wy / blk[blk.length - 2].w > blk[blk.length - 1].wy / blk[blk.length - 1].w) {
+      const b = blk.pop(), a = blk[blk.length - 1]; a.w += b.w; a.wy += b.wy; a.m.push(...b.m); } }
+  blk.forEach(b => b.m.forEach(p => p.fit = b.wy / b.w));
+  const dof = pts.reduce((a, p) => a + p.n - 1, 0), sd = dof ? Math.sqrt(pts.reduce((a, p) => a + p.ss, 0) / dof) : 0.3;
+  const predict = x => { if (x <= pts[0].x) return pts[0].fit; const z = pts[pts.length - 1]; if (x >= z.x) return z.fit;
+    for (let i = 1; i < pts.length; i++) if (x <= pts[i].x) { const a = pts[i - 1], b = pts[i], t = (x - a.x) / (b.x - a.x); return a.fit + (b.fit - a.fit) * t; } };
+  return { pts, sd, predict, x0: pts[0].x, x1: pts[pts.length - 1].x };
+}
+const LCAL = buildCal(LUX);
+LCAL.loo = LCAL.pts.map(p => { const c = buildCal(LUX.filter(L0 => L0.s !== p.s)); return { s: p.s, y: c.predict(p.x), clamped: p.x < c.x0 || p.x > c.x1 }; });
+const EXTRAP_TOL = 0.02; // dex of glow ratio beyond the measured range before a pixel counts as extrapolated
+function luxEstimate(lat, lon) { const x = glowX(lat, lon), y = LCAL.predict(x);
+  return { v: 10 ** y, lo: 10 ** (y - LCAL.sd), hi: 10 ** (y + LCAL.sd), x, extrap: x < LCAL.x0 - EXTRAP_TOL || x > LCAL.x1 + EXTRAP_TOL }; }
+// ~200 m grid over the islands and the mainland out to Al Wathba, in Web-Mercator rows so it registers with the tiles
+const LG = { s: 24.20, n: 24.60, w: 54.25, e: 54.72, W: 240 };
+LG.yN = mercY(LG.n); LG.yS = mercY(LG.s); LG.H = Math.round(LG.W * (LG.yN - LG.yS) / ((LG.e - LG.w) * D2R));
+const LGX = new Float32Array(LG.W * LG.H);
+for (let r = 0; r < LG.H; r++) { const la = invMerc(LG.yN - (r + .5) / LG.H * (LG.yN - LG.yS));
+  for (let c = 0; c < LG.W; c++) LGX[r * LG.W + c] = glowX(la, LG.w + (c + .5) / LG.W * (LG.e - LG.w)); }
+function paintLux() {
+  const cv = document.createElement("canvas"); cv.width = LG.W; cv.height = LG.H;
+  const g = cv.getContext("2d"), img = g.createImageData(LG.W, LG.H);
+  for (let i = 0; i < LGX.length; i++) { const x = LGX[i], c = luxRamp(LCAL.predict(x)), out = Math.max(0, LCAL.x0 - x, x - LCAL.x1);
+    img.data.set([c[0], c[1], c[2], Math.round(175 - 70 * Math.min(1, out / 0.15))], i * 4); }  // fades smoothly beyond the measured range
+  g.putImageData(img, 0, 0); return cv.toDataURL();
+}
+const luxSurface = L.imageOverlay(paintLux(), [[LG.s, LG.w], [LG.n, LG.e]], { interactive: false }).addTo(map);
+luxLayer.eachLayer(m => m.setZIndexOffset(1000));
+
 L.control.layers(null,
-  { "Lux meter readings · 4 Nov 2026": luxLayer,
+  { "Estimated lux surface (fit to readings)": luxSurface,
+    "Lux meter readings · 4 Nov 2026": luxLayer,
     "Sky brightness · selected hour": skyNow, "Stargazing suitability · selected hour": scoreNow,
     "Sky brightness reference (moonless, clear)": sqmLayer,
     "Satellite: VIIRS Black Marble 2016": viirsBM, [`Satellite: VIIRS DNB ${yday}`]: viirsDNB,
@@ -1477,6 +1526,7 @@ function drawLegend() {
   if (map.hasLayer(sqmLayer)) h += `<div style="margin-top:6px"><b>Reference</b>: moonless, clear, AOD 0.35, lights constant</div><div class="ramp" style="background:${cssRamp(SQM_STOPS, 16.8, 21.9)}"></div><div class="ticks"><span>16.8</span><span>18</span><span>19.5</span><span>21</span><span>21.9</span></div>`;
   if (map.hasLayer(viirsBM) || map.hasLayer(viirsDNB)) h += `<div style="margin-top:6px;color:var(--sodium)">Satellite layers show light emitted upward, not sky brightness.</div>`;
   if ((map.hasLayer(viirsBM) || map.hasLayer(viirsDNB)) && satFailed) h += `<div class="map-note">NASA GIBS tiles did not load. They need an internet connection; the rest of the map works without one.</div>`;
+  if (map.hasLayer(luxSurface)) h += `<div><b>Estimated lux</b> · lit open areas, early evening</div><div style="color:var(--ink2)">Calibrated from ${LUX.length} sites; faded = beyond the measured range. Typical spread ×÷${(10 ** LCAL.sd).toFixed(1)}.</div>` + (map.hasLayer(luxLayer) ? "" : `<div class="ramp" style="background:linear-gradient(90deg,${LUX_STOPS.map(([v, c]) => `rgb(${c[0]},${c[1]},${c[2]}) ${((v + 1) / 3.3 * 100).toFixed(1)}%`).join(",")})"></div><div class="ticks"><span>0.1</span><span>1</span><span>10</span><span>100 lx</span></div>`);
   if (map.hasLayer(luxLayer)) h += `<div style="margin-top:6px"><b>Lux meter</b> · median per session, 4 Nov 2026</div><div class="ramp" style="background:linear-gradient(90deg,${LUX_STOPS.map(([v, c]) => `rgb(${c[0]},${c[1]},${c[2]}) ${((v + 1) / 3.3 * 100).toFixed(1)}%`).join(",")})"></div><div class="ticks"><span>0.1</span><span>1</span><span>10</span><span>100 lx</span></div>`;
   if (baseNote) h += `<div class="map-note">${esc(baseNote)}</div>`;
   el.innerHTML = h || "Turn on a layer to see its scale."; el.hidden = false;
@@ -1543,6 +1593,7 @@ function updateSite(full) {
     ["Zenith sky now (SQM reading)", ev.e.sun.alt > -6 ? "daylight / bright twilight" : fmt(ev.sqmSky, 2) + " mag/arcsec²"],
     ...(ev.e.sun.alt <= -6 && Math.abs(ev.sqmSky - ev.sqm) > 0.05 ? [["Through clear gaps", fmt(ev.sqm, 2) + " mag/arcsec²"]] : []),
     ["Limiting magnitude", ev.e.sun.alt > -6 ? "—" : fmt(ev.nelm, 2)],
+    ["Estimated lux, lit open area", (() => { const e = luxEstimate(site.lat, site.lon); return `${fmtLux(e.v)} lx (${fmtLux(e.lo)}–${fmtLux(e.hi)})${e.extrap ? " · beyond measured range" : ""}`; })()],
     ["Data source", w.srcTxt],
   ];
   $("nowRows").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("");
@@ -1789,14 +1840,46 @@ function drawHistory() {
   $("histFindings").innerHTML = `<h3>What the last 12 months show</h3><p>Across ${HIST.length.toLocaleString()} site-nights, the strongest rank associations with a poor score were ${top.join(", ")}. Averaged over the year at 23:00, artificial light cost ${lost("Urban", "light").toFixed(1)} magnitudes at urban sites against ${lost("Desert", "light").toFixed(1)} in the desert; the Moon cost ${lost("Desert", "moonL").toFixed(1)} and aerosol ${lost("Desert", "aer").toFixed(1)} magnitudes at desert sites.</p>`;
 }
 let analysisDrawn = false;
-function drawAnalysis() { if (analysisDrawn) return; analysisDrawn = true; drawZoneTable(); drawDecomp(); }
+function drawLuxFit() {
+  const W = 360, H = 230, l = 40, r = 8, t = 8, b = 34, X0 = 0.95, X1 = 1.9, Y0 = -3, Y1 = 2.5;
+  const px = x => l + (x - X0) / (X1 - X0) * (W - l - r), py = y => t + (Y1 - y) / (Y1 - Y0) * (H - t - b);
+  const skyLuxAt = x => { const bn = M.mag2nl(M.P.natural); return Math.log10(Math.PI * 1.08e5 * Math.pow(10, -0.4 * M.nl2mag(bn * (1 + 10 ** x)))); };
+  let s = `<svg class="chart" viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Lux readings against modeled artificial glow, log–log">`;
+  for (let y = Y0; y <= Y1; y++) s += `<line class="grid" x1="${l}" x2="${W - r}" y1="${py(y)}" y2="${py(y)}"/><text x="${l - 5}" y="${py(y) + 3.5}" text-anchor="end">${10 ** y >= 1 ? 10 ** y : (10 ** y).toFixed(-y)}</text>`;
+  [10, 20, 50].forEach(v => { const x = px(Math.log10(v)); s += `<line class="grid" x1="${x}" x2="${x}" y1="${t}" y2="${H - b}"/><text x="${x}" y="${H - b + 13}" text-anchor="middle">${v}×</text>`; });
+  s += `<text x="${(l + W - r) / 2}" y="${H - 4}" text-anchor="middle">modeled artificial glow (× natural sky)</text><text x="11" y="${(t + H - b) / 2}" text-anchor="middle" transform="rotate(-90 11 ${(t + H - b) / 2})">lux</text>`;
+  s += `<rect x="${px(LCAL.x0)}" y="${t}" width="${px(LCAL.x1) - px(LCAL.x0)}" height="${H - t - b}" style="fill:var(--starlight);opacity:.07"/>`;
+  let sky = "", cal = ""; for (let x = X0; x <= X1 + 1e-9; x += 0.01) { sky += `${px(x).toFixed(1)},${py(skyLuxAt(x)).toFixed(1)} `; cal += `${px(x).toFixed(1)},${py(LCAL.predict(x)).toFixed(1)} `; }
+  s += `<polyline points="${sky}" fill="none" stroke-width="1.5" stroke-dasharray="4 3" style="stroke:var(--starlight)"/>`;
+  s += `<polyline points="${cal}" fill="none" stroke-width="2" style="stroke:var(--sodium)"/>`;
+  LUX.forEach(L0 => { const x = glowX(L0.lat, L0.lon);
+    L0.r.forEach(([, v], k) => { const c = luxRGB(v); s += `<circle cx="${px(x) + (k - (L0.r.length - 1) / 2) * 2.2}" cy="${py(Math.log10(v))}" r="3.2" style="fill:rgb(${c[0]},${c[1]},${c[2]});stroke:var(--panel)"/>`; });
+    const pt = LCAL.pts.find(p => p.s === L0.s); s += `<text x="${px(x) + 9}" y="${py(pt.y) - 6}" style="fill:var(--ink);font-weight:600">${L0.s}</text>`; });
+  s += `<text x="${W - r - 2}" y="${py(skyLuxAt(X1)) - 6}" text-anchor="end" style="fill:var(--starlight)">sky glow alone</text>`;
+  $("luxChart").innerHTML = s + `</svg>`;
+  const f = y => fmtLux(10 ** y);
+  $("luxTbl").innerHTML = `<tr><th>Session</th><th>Glow</th><th>n</th><th>Geo. mean</th><th>Spread</th><th>Left out</th></tr>` + LCAL.pts.map(p => { const lo = LCAL.loo.find(q => q.s === p.s);
+    return `<tr><td>${p.s} · ${esc((p.site.match(/\(([^)]+)\)/) || [, p.site.replace(/ desert pin$/, "")])[1])}</td><td>${(10 ** p.x).toFixed(0)}×</td><td>${p.n}</td><td>${f(p.y)} lx</td><td>×÷${(10 ** Math.sqrt(p.ss / Math.max(1, p.n - 1))).toFixed(1)}</td><td>${f(lo.y)} lx${lo.clamped ? "*" : ""}</td></tr>`; }).join("");
+  const mid = LCAL.loo.filter(q => !q.clamped).map(q => Math.abs(q.y - LCAL.pts.find(p => p.s === q.s).y));
+  $("luxNote").textContent = `"Left out" re-fits without that site and predicts it. ${mid.length ? `The one site inside the others' range is predicted within a factor of ${(10 ** Math.max(...mid)).toFixed(1)}.` : ""} * The end sites fall outside the remaining range, so their prediction is just the nearest site held flat: the calibration cannot be tested there until more sites are measured. Spread is the within-session scatter, mostly from where the meter stood relative to lamps.`;
+}
+function drawAnalysis() { if (analysisDrawn) return; analysisDrawn = true; drawZoneTable(); drawDecomp(); drawLuxFit(); }
 $("histBtn").onclick = loadHistory;
 
 /* ---------- boot ---------- */
 $("findings").innerHTML = "<h3>Initial findings</h3>\n<p><b>Artificial light is the dominant spatial factor.</b> On a moonless, clear night with typical aerosol (AOD 0.35), the model puts the Abu Dhabi Corniche at 17.3 mag/arcsec\u00b2 (Bortle 9, about 30 stars visible) and the Liwa sands at Tal Moreeb at 21.8 (Bortle 3, about 1,700 stars). Removing artificial light would recover 3.2 magnitudes of limiting magnitude at the Corniche, 2.2 at Al Wathba, 1.6 at Sweihan and under 0.05 in the Rub' al Khali edge.</p>\n<p><b>The Moon is the dominant time factor at dark sites.</b> Averaged over a lunar month at 23:00, moonlight costs about 0.85 magnitudes in the desert but only 0.15 at the Corniche, because the city sky is already 65 times brighter than natural. A high full moon brings the desert down to roughly what the Corniche sees on a moonless night.</p>\n<p><b>Aerosol and dust act on both ends.</b> Going from clean air (AOD 0.1) to a dusty night (AOD 0.7) lowers the desert limiting magnitude by about 0.6 and cuts the visible star count by about 60%, mostly by dimming stars below 40\u00b0 altitude (extinction grows with airmass). Near cities the same dust also scatters more city light back down, so the Corniche loses about 85% of its remaining stars. Summer (June\u2013August) is the dustiest season over the UAE.</p>\n<p><b>Cloud is rare but absolute.</b> Most nights in the emirate are clear; cloud is concentrated in December\u2013March. When low or mid cloud is present, no other factor matters. Over cities cloud also reflects light back down and brightens the sky further.</p>\n<p><b>Humidity acts indirectly.</b> High relative humidity swells hygroscopic particles (raising AOD and haze) and causes dew on optics, which matters most on the coast and the islands. The model has no separate humidity term; the 12-month analysis tests whether humidity still tracks poor nights through its link to aerosol and cloud.</p>\n<p><b>Best places and times.</b> The darkest modeled skies are in the dunes south of the Liwa crescent and in the Al Qua'a\u2013Umm Al Zamool sands (Bortle 3), on clear, moonless nights from October to March, after astronomical twilight ends (about 75 minutes after sunset). Jebel Hafeet reaches Bortle 4 despite Al Ain below it, because the summit sits above part of the dust layer.</p>\n<div id=\"histFindings\"></div>\n";
+const LUX_METHOD = `<h3>10 · From three lux readings to a city-wide surface</h3>
+<p>The meter measures <b>illuminance</b> (lux) on an upward-facing sensor. In a lit car park that is mostly light straight from nearby lamps; the sky contributes about 0.01–0.03 lx in the city and less in the desert (the dashed line in Analysis §4). So the readings describe lit open spaces, not the sky.</p>
+<p>Three sites are too few for a purely spatial interpolation such as kriging or inverse-distance weighting, which would only draw rings around each pin. A straight log–log regression on the model's glow ratio fits the three sites (R² 0.90) but its slope of 4.7 runs away outside them, predicting about 16,000 lx on Reem Island. The surface therefore uses a bounded calibration:</p>
+<ul><li>The covariate is the modeled artificial glow ratio at each point (Walker's law, AOD 0.35, lights constant), on a ~200 m grid.</li>
+<li>Each site's readings are averaged in log space (geometric mean), and the site values are forced to rise with glow (pool-adjacent-violators).</li>
+<li>Between sites the curve is linear in log–log space; beyond the dimmest and brightest site it is held flat, and those areas are faded on the map.</li>
+<li>The quoted range is the pooled within-session scatter, about ×÷2.</li></ul>
+<p><b>Limits.</b> The glow model varies over kilometres, so the surface is a neighbourhood-scale estimate of how bright a typical lit open area is, not a street-by-street map. Only the middle site can be checked by leaving it out; the end sites cannot. The desert value (0.12 lx) is probably near the meter's floor. More sites, especially dark parks, beaches and residential streets on the island, would test and sharpen the calibration; adding them to the LUX list refits everything.</p>`;
 $("pane-method").innerHTML = "<h2>Method</h2>\n<p class=\"sub\">From light leaving the ground to a star you can or cannot see, step by step.</p>\n\n<h3>1 \u00b7 What the satellite measures</h3>\n<p>The VIIRS Day/Night Band on Suomi-NPP and NOAA-20 records <b>upward radiance</b> at the top of the atmosphere, in nW\u00b7cm\u207b\u00b2\u00b7sr\u207b\u00b9, over 500\u2013900 nm, looking roughly straight down at about 01:30 local time. Annual composites (NOAA VIIRS DNB V2.2, on Earth Engine as <code>NOAA/VIIRS/DNB/ANNUAL_V22</code>) remove clouds, fires and stray light. Black Marble, shown on this map through NASA GIBS, is a related cloud-free composite rendered as an 8-bit image, so its pixel values are relative, not radiance.</p>\n<p>Three properties make this different from sky brightness:</p>\n<ul>\n<li><b>Direction.</b> The satellite sees light going up, mostly from lit surfaces. Sky glow is driven largely by light leaving fixtures near the horizontal, which travels far through the low atmosphere.</li>\n<li><b>Spectrum.</b> The band starts at 500 nm, so it misses most of the blue peak of white LEDs (~450 nm). Blue light scatters most strongly in air (Rayleigh scattering \u221d \u03bb\u207b\u2074), so an LED conversion can look dimmer from orbit while the sky gets brighter.</li>\n<li><b>Location.</b> A pixel describes emission from that 500 m cell. The sky above any point is lit by every source within a few hundred kilometres, weighted by distance and atmosphere.</li>\n</ul>\n\n<h3>2 \u00b7 From emission to sky brightness</h3>\n<p>The World Atlas of Artificial Night Sky Brightness (Falchi et al. 2016) solves this properly: it takes VIIRS radiance as the source term, propagates it with the Cinzano\u2013Garstang radiative transfer model, and calibrates the result against ~20,000 ground SQM readings. The atlas GeoTIFF (GFZ Data Services) is the right baseline to compare this page against. In the browser, this page uses the simpler empirical form, Walker's law:</p>\n<div class=\"eq\">ratio = \u03a3\u1d62 C \u00b7 P\u1d62 \u00b7 d_eff\u207b\u00b2\u00b7\u2075 \u00b7 (\u03c4/\u03c4\u2080)^0.4 \u00b7 exp(\u2212d / L(\u03c4)),  d_eff = \u221a(d\u00b2 + R\u1d62\u00b2)</div>\n<p><code>ratio</code> is artificial zenith brightness divided by the natural sky. <code>P\u1d62</code> is a population-equivalent emission for each of 46 sources (towns plus ports, refineries, gas plants), <code>R\u1d62</code> is the source radius so the law does not diverge inside a city, and <code>C = 0.0068</code> was tuned so central Abu Dhabi lands near 17.3 mag/arcsec\u00b2 (Walker's original value was 0.01). The two aerosol terms are heuristics: more aerosol near a city scatters more light down, while along a long path it removes light (<code>L = 130 km</code> at \u03c4\u2080 = 0.35, shrinking as \u221a(\u03c4\u2080/\u03c4)).</p>\n\n<h3>3 \u00b7 Units</h3>\n<p>Sky brightness is a surface brightness in <b>magnitudes per square arcsecond</b>. The scale is logarithmic and inverted: 5 magnitudes is a factor of 100, so 17.3 is about 65 times brighter than 21.85. Brightnesses add in linear units, so each term is converted to nanolamberts, summed, and converted back:</p>\n<div class=\"eq\">B[nL] = 34.08 \u00b7 exp(20.7233 \u2212 0.92104 \u00b7 V)</div>\n<p>The natural sky is set to 21.85 V mag/arcsec\u00b2 (airglow, zodiacal light, faint stars). It varies by about \u00b10.2 with the solar cycle and season. The atlas expresses the same quantity in \u00b5cd/m\u00b2; its natural reference of 174 \u00b5cd/m\u00b2 is about 22.0 mag/arcsec\u00b2.</p>\n\n<h3>4 \u00b7 Extinction</h3>\n<p>Light from a star is dimmed by <code>k\u00b7X</code> magnitudes, where <code>X</code> is airmass and <code>k</code> the extinction coefficient:</p>\n<div class=\"eq\">k = 0.13\u00b7e^(\u2212h/8) + 0.03 + 1.086\u00b7\u03c4\u2085\u2085\u2080\u00b7e^(\u2212h/1.5)     X = (1 \u2212 0.96\u00b7sin\u00b2z)^\u2212\u00bd</div>\n<p>The first two terms are Rayleigh and ozone in the V band; the third converts aerosol optical depth (from CAMS) to magnitudes, scaled for site elevation <code>h</code> in km. Over the UAE, \u03c4 is often 0.3\u20130.7, so dust usually dominates extinction.</p>\n\n<h3>5 \u00b7 Moonlight</h3>\n<p>Scattered moonlight follows Krisciunas &amp; Schaefer (1991): Moon brightness from its phase angle, a scattering function of the angle between the Moon and the sky point (Rayleigh plus a forward-peaked aerosol term), and extinction along both paths. The implementation reproduces the reference value of 19.855 mag/arcsec\u00b2 for the published test case.</p>\n\n<h3>6 \u00b7 From sky brightness to stars</h3>\n<p>Naked-eye limiting magnitude follows from zenith sky brightness with a relation fitted to SQM and observer data:</p>\n<div class=\"eq\">NELM = 7.93 \u2212 5\u00b7log\u2081\u2080(10^(4.316 \u2212 SQM/5) + 1)</div>\n<p>For each of 15,544 Hipparcos-based stars (to magnitude 7), the page computes the local sky brightness in that star's direction (natural sky rising toward the horizon, artificial glow \u221d X^0.8, moonlight at that angle) and counts the star as visible if <code>m + k\u00b7X \u2212 0.25 \u2264 NELM</code>. The 0.25 removes the extinction already folded into the empirical relation. A constellation is \"recognisable\" when at least 80% of its figure stars are visible.</p>\n\n<h3>7 \u00b7 Clouds and the score</h3>\n<p>Clear line-of-sight fraction = (1 \u2212 low)(1 \u2212 mid)(1 \u2212 0.6\u00b7high), with high cloud weighted lower because it is often thin cirrus. Suitability = 100 \u00d7 clear fraction \u00d7 (NELM \u2212 3) / 3.6, clipped to 0\u2013100, and zero until the Sun is 12\u00b0 below the horizon.</p>\n\n\n<h3>7b \u00b7 How the map changes hour by hour</h3>\n<p>The \"Sky brightness \u00b7 selected hour\" layer is recomputed for every hour on the slider. The slider covers night hours only (Sun more than 12\u00b0 below the horizon, about 11 hours a night in October), so the next 7 nights give roughly 77 maps. Four things change with time:</p>\n<ul>\n<li><b>Moon and twilight.</b> Moon position and phase are computed at the four corners of the region and interpolated; the Sun sets the twilight term.</li>\n<li><b>Aerosol.</b> Each pixel takes its hourly CAMS optical depth. Walker's-law sums are precomputed at 13 AOD levels and interpolated, which makes each map a few milliseconds of work.</li>\n<li><b>Cloud.</b> Low and mid cloud reflect city light back down and block airglow. The artificial part is multiplied by <code>1 + 9\u00b7r/(r+3)</code> under full overcast, where <code>r</code> is the artificial-to-natural ratio; natural light drops to 30%. This reproduces Kyba et al. (2011): overcast skies ~10\u00d7 brighter than clear in central Berlin, ~2.8\u00d7 at 32 km. The map therefore shows what a sky-quality meter would read, so cities brighten and the desert darkens under cloud.</li>\n<li><b>Lights dimming through the night (assumption).</b> Off by default. The header menu applies a linear decline from 21:00 to 03:00. The 40% option follows the overnight decline Kyba et al. measured in Berlin; the \"halves\" option follows the more than twofold drop Pun &amp; So reported in Hong Kong when lights switch off near midnight. No equivalent UAE measurement exists, so this is a scenario, not a prediction.</li>\n</ul>\n<p>Frames are filled outward from the slider position in short background slices. Play blends linearly between neighbouring hours within a night and jumps straight from one dawn to the next dusk.</p>\n\n<h3>8 \u00b7 Data sources</h3>\n<ul>\n<li>Weather: Open-Meteo forecast (cloud layers, humidity, visibility) and ERA5 archive, on a 0.7\u00b0 grid of 40 points, interpolated bilinearly.</li>\n<li>Aerosol: CAMS aerosol optical depth at 550 nm and dust via the Open-Meteo air-quality API.</li>\n<li>Stars and constellation figures: d3-celestial catalogue (Hipparcos-derived).</li>\n<li>Basemap: CARTO Dark Matter (dark theme) or Voyager (light theme) raster tiles with OpenStreetMap data, switched with the sun/moon button. Satellite layers: NASA GIBS, loaded only when switched on.</li>\n<li>Field data: 16 lux-meter readings taken on Wednesday 4 November 2026 between 19:20 and 20:32 GST at three sites (Al Bateen, Al Muntazah, Al Wathba). The Moon was below the horizon for all of them.</li>\n</ul>\n<p><b>Why not Gaia for naked-eye stars.</b> Gaia's detectors saturate on bright stars: its catalogue is incomplete for roughly G &lt; 3 and its bright-star photometry is less reliable, so the naked-eye set comes from Hipparcos. Gaia becomes the right source for binocular or telescope limits (magnitude 8\u201315). A query for a field around Orion:</p>\n<pre>SELECT source_id, ra, dec, phot_g_mean_mag, bp_rp\nFROM gaiadr3.gaia_source\nWHERE phot_g_mean_mag &lt; 9\n  AND 1 = CONTAINS(POINT(ra, dec), CIRCLE(83.8, -5.4, 10))</pre>\n<p>Send it to <code>https://gea.esac.esa.int/tap-server/tap/sync</code> with <code>REQUEST=doQuery&amp;LANG=ADQL&amp;FORMAT=json</code>.</p>\n\n<h3>9 \u00b7 What needs ground validation</h3>\n<ul>\n<li><b>The calibration itself.</b> One constant was tuned to one city. Seasonal SQM-L or TESS-W readings at the seven diamond markers would replace it with a fit.</li>\n<li><b>Source emissions.</b> Population-equivalent values are estimates. Replacing them with VIIRS radiance sums per source (from the Earth Engine dataset) is the next step.</li>\n<li><b>Distance law.</b> The \u22122.5 exponent is from 1970s California. Gulf cities use more LED and more upward-directed architectural light.</li>\n<li><b>Aerosol terms.</b> The near-city amplification and far-field attenuation are heuristics, least certain during dust events.</li>\n<li><b>Elevation and inversions.</b> Jebel Hafeet's advantage depends on the night-time inversion height.</li>\n<li><b>Humidity and dew.</b> Not modeled separately from AOD.</li>\n<li><b>Time behaviour of lighting.</b> Whether Abu Dhabi lighting dims after midnight, and by how much, needs a continuous SQM record (one TESS-W photometer in the city and one in the desert would separate lighting changes from moon and dust).</li>\n<li><b>Cloud amplification.</b> Fitted to Berlin; Gulf cloud is often higher and thinner, which should amplify less.</li>\n</ul>\n";
 // open on tonight: the current hour if it is already dark, otherwise the next 22:00 local
 { let p = 0; if (HRS[0] !== 0) { const q = HRS.findIndex(f => localHour(new Date(t0 + f * HOUR)) === 22); if (q >= 0) p = q; } tf = p; tIdx = HRS[p]; }
+$("pane-method").insertAdjacentHTML("beforeend", LUX_METHOD);
 booted = true; setLabels(); updateSite(true); scheduleFrames(); renderMap();
 try { document.fonts.ready.then(() => updateSite(false)); } catch (e) {}
 loadWeather().then(st => { $("siteCoord").title = st.join("; "); analysisDrawn = false; invalidateFrames(); updateSite(true);
